@@ -18,6 +18,8 @@ This project demonstrates how **AI + real-time APIs** can improve urban public t
 - ✅ **Trip analytics tracking**
 
 ---
+<img width="1919" height="916" alt="image" src="https://github.com/user-attachments/assets/5eb157e3-faf0-43f4-9490-caed779fff76" />
+
 
 # 🛠️ Technologies Used
 
