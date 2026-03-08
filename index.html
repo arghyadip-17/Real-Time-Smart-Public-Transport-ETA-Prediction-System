@@ -1,0 +1,345 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Real-time Smart Public Transport ETA Prediction System</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css"/>
+  <style>
+    body { margin:0; font-family:Arial, sans-serif; background:linear-gradient(135deg,#1e3c72,#2a5298); height:100vh; display:flex; align-items:center; justify-content:center; }
+    .container { display:flex; width:94%; height:92%; gap:18px; }
+    .card { width:420px; background:#fff; border-radius:14px; padding:18px; box-shadow:0 18px 30px rgba(0,0,0,0.2); overflow:auto; }
+    #map { flex:1; border-radius:14px; }
+    input { width:100%; padding:8px; margin:8px 0; border-radius:8px; border:1px solid #ccc; }
+    button { width:100%; padding:10px; border-radius:8px; border:none; background:#2a5298; color:#fff; cursor:pointer; margin-top:6px; }
+    button:disabled { opacity:.6; cursor:progress; }
+    .result { margin-top:12px; font-weight:700; text-align:center; }
+    .small { font-size:12px; color:#666; margin-top:8px; }
+    ul { padding-left:18px; }
+    .analyticsBox { margin-top:14px; padding:12px; border-radius:10px; background:#0f1724; color:#e6f0ff; }
+    .analyticsRow { display:flex; gap:8px; align-items:center; justify-content:space-between; padding:6px 0; }
+    .analyticsTitle { font-weight:700; margin-bottom:8px; }
+    canvas { max-width:100%; }
+    label { display:block; margin-top:10px; font-size:14px; }
+  </style>
+
+  <!-- Chart.js for analytics charts -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+  <div class="container">
+    <div class="card">
+      <h2 style="text-align:center">🚍 Real-time Smart Public Transport ETA Prediction System</h2>
+
+      <label class="small">Click map to set current vehicle location (stop auto-detected)</label>
+
+      <label><b>📍 Latitude</b></label>
+      <input id="lat" type="number" placeholder="Enter latitude" step="any" />
+
+      <label><b>📍 Longitude</b></label>
+      <input id="lon" type="number" placeholder="Enter longitude" step="any" />
+
+      <label><b>🚀 Current Speed (km/h)</b></label>
+      <input id="speed" type="number" placeholder="Enter vehicle speed" />
+
+      <label><b>📡 Sensor Estimate (Traffic Raw Value)</b></label>
+      <input id="sensor" type="number" placeholder="Enter traffic sensor value" />
+
+      <label><b>🛑 Starting Stop Index</b></label>
+      <input id="stop" type="number" placeholder="Auto-filled when map clicked" />
+
+      <button id="predictBtn" onclick="getPrediction()">Predict</button>
+      <button id="analyticsBtn" onclick="loadAnalytics()" style="margin-top:8px;background:#1f7aef">Show Driver Analytics</button>
+
+      <div class="result" id="result"></div>
+      <div class="small" id="perStops"></div>
+      <div class="small" id="debugLog"></div>
+
+      <div id="analyticsBox" class="analyticsBox" style="display:none;">
+        <div class="analyticsTitle">🚦 Driver Analytics</div>
+        <div id="analyticsContent">Loading...</div>
+        <div style="margin-top:10px;"><canvas id="occChart" width="300" height="200"></canvas></div>
+      </div>
+    </div>
+
+    <div id="map"></div>
+  </div>
+
+  <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+  <script>
+    // --- Named stops (coordinates and names) ---
+    const STOPS = [
+      { name: "Shobhabazar", coords: [22.5980, 88.3650] },
+      { name: "Shobhabazar Metro", coords: [22.5960, 88.3680] },
+      { name: "Hatibagan", coords: [22.5935, 88.3720] },
+      { name: "Maniktala", coords: [22.5895, 88.3770] },
+      { name: "Vivekananda Road", coords: [22.5855, 88.3810] },
+      { name: "Rajabazar", coords: [22.5825, 88.3860] },
+      { name: "Sealdah", coords: [22.5755, 88.3920] },
+      { name: "Moulali", coords: [22.5725, 88.3970] },
+      { name: "CIT Road", coords: [22.5690, 88.4010] },
+      { name: "Phoolbagan", coords: [22.5660, 88.4050] },
+      { name: "Kankurgachi", coords: [22.5625, 88.4100] },
+      { name: "Ultadanga", coords: [22.5890, 88.4120] }
+    ];
+
+    // simple haversine
+    function haversineKm(a,b){
+      const toRad = v => v*Math.PI/180;
+      const lat1 = toRad(a[0]), lon1 = toRad(a[1]), lat2 = toRad(b[0]), lon2 = toRad(b[1]);
+      const dlat = lat2-lat1, dlon = lon2-lon1;
+      const R = 6371.0;
+      const s = Math.sin(dlat/2)**2 + Math.cos(lat1)*Math.cos(lat2)*Math.sin(dlon/2)**2;
+      return 2*R*Math.asin(Math.sqrt(s));
+    }
+
+    // Map init (center roughly over the route)
+    const map = L.map('map').setView([22.580,88.389],13);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png').addTo(map);
+
+    // draw route polyline & stop markers using named stops
+    const routeLine = L.polyline(STOPS.map(s => s.coords), {color:'#1e90ff', weight:4}).addTo(map);
+    const stopMarkers = STOPS.map((stop, i) => {
+      return L.marker(stop.coords)
+        .addTo(map)
+        .bindPopup(`<b>🛑 Stop ${i}</b><br>${stop.name}`);
+    });
+
+    let marker = null;    // current vehicle marker
+    let occCircle = null; // occupancy circle
+    let animHandle = null;
+    let occChart = null;  // Chart.js instance
+
+    // Auto-fill inputs by clicking on map; detect nearest stop (by coords)
+    map.on('click', (e) => {
+      document.getElementById('lat').value = e.latlng.lat.toFixed(6);
+      document.getElementById('lon').value = e.latlng.lng.toFixed(6);
+
+      // nearest stop heuristic (distance to stop coords)
+      let bestIdx = 0, bestD = Infinity;
+      for (let i=0;i<STOPS.length;i++){
+        const d = haversineKm([e.latlng.lat,e.latlng.lng], STOPS[i].coords);
+        if (d < bestD){ bestD = d; bestIdx = i; }
+      }
+      // choose previous stop index if possible (vehicle is between stops)
+      const stopIndex = Math.max(0, bestIdx-1);
+      document.getElementById('stop').value = stopIndex;
+
+      if (marker) map.removeLayer(marker);
+      marker = L.marker([e.latlng.lat,e.latlng.lng]).addTo(map).bindPopup(`lat:${e.latlng.lat.toFixed(6)} lon:${e.latlng.lng.toFixed(6)}<br>stop:${stopIndex}`).openPopup();
+    });
+
+    // demo defaults
+    document.getElementById('speed').value = 18;
+    document.getElementById('sensor').value = 6;
+
+    // animate function: move marker along list of latlngs over totalSeconds (simulation)
+    function animateAlong(pathLatLngs, totalSeconds, onTick, onComplete){
+      if (animHandle) { clearInterval(animHandle); animHandle = null; }
+      if (!pathLatLngs || pathLatLngs.length<2){ if(onComplete) onComplete(); return; }
+
+      const stepsPerSec = 10;
+      const totalSteps = Math.max(1, Math.floor(totalSeconds * stepsPerSec));
+      let step = 0;
+
+      const segLen = [];
+      let totalDist = 0;
+      for (let i=0;i<pathLatLngs.length-1;i++){
+        const d = haversineKm(pathLatLngs[i], pathLatLngs[i+1]);
+        segLen.push(d);
+        totalDist += d;
+      }
+      if (totalDist <= 0){
+        if (marker) marker.setLatLng(pathLatLngs[pathLatLngs.length-1]);
+        if(onComplete) onComplete();
+        return;
+      }
+
+      animHandle = setInterval(()=>{
+        const frac = Math.min(1, step/totalSteps);
+        const targetDist = frac * totalDist;
+        let acc = 0;
+        let segIdx = 0;
+        while(segIdx < segLen.length && acc + segLen[segIdx] < targetDist){
+          acc += segLen[segIdx];
+          segIdx++;
+        }
+        const segPos = (segIdx >= segLen.length) ? 1.0 : ((targetDist - acc) / Math.max(1e-9, segLen[segIdx]));
+        const a = pathLatLngs[segIdx];
+        const b = pathLatLngs[Math.min(segIdx+1, pathLatLngs.length-1)];
+        const lat = a[0] + (b[0]-a[0]) * segPos;
+        const lon = a[1] + (b[1]-a[1]) * segPos;
+
+        if (!marker){
+          marker = L.marker([lat, lon]).addTo(map);
+        } else {
+          marker.setLatLng([lat, lon]);
+        }
+        if (onTick) onTick({lat, lon, frac});
+
+        step++;
+        if (step > totalSteps){
+          clearInterval(animHandle);
+          animHandle = null;
+          if (onComplete) onComplete();
+        }
+      }, 1000/stepsPerSec);
+    }
+
+    // helper to set occupancy circle color
+    function occColor(cat){
+      return cat === "Low" ? "#2ecc71" : (cat === "Medium" ? "#f1c40f" : "#e74c3c");
+    }
+
+    async function getPrediction(){
+      const btn = document.getElementById('predictBtn');
+      btn.disabled = true;
+      document.getElementById('result').innerHTML = '';
+      document.getElementById('perStops').innerHTML = '';
+      document.getElementById('debugLog').innerText = '';
+
+      const latRaw = document.getElementById('lat').value;
+      const lonRaw = document.getElementById('lon').value;
+      const speedRaw = document.getElementById('speed').value;
+      const sensorRaw = document.getElementById('sensor').value;
+      const stopRaw = document.getElementById('stop').value;
+
+      if(!latRaw || !lonRaw){ alert('Click map to pick location'); btn.disabled = false; return; }
+
+      const payload = {
+        lat: parseFloat(latRaw),
+        lon: parseFloat(lonRaw),
+        speed_kmph: parseFloat(speedRaw || 10),
+        sensor_estimate: parseFloat(sensorRaw || 5),
+        stop_index: parseInt(stopRaw || 0)
+      };
+
+      document.getElementById('debugLog').innerText = 'Sending payload: ' + JSON.stringify(payload);
+
+      try {
+        const resp = await fetch('http://127.0.0.1:8000/predict', {
+          method: 'POST',
+          headers: {'Content-Type':'application/json'},
+          body: JSON.stringify(payload)
+        });
+        const j = await resp.json();
+        if (!resp.ok) {
+          document.getElementById('debugLog').innerText = 'Server error: ' + JSON.stringify(j);
+          btn.disabled = false;
+          return;
+        }
+
+        // Display result fields
+        document.getElementById('result').innerHTML = `
+          Total ETA: <b>${j.total_eta_minutes.toFixed(2)}</b> mins<br/>
+          Predicted speed (adj): <b>${j.predicted_speed_kmph} km/h</b><br/>
+          Occupancy: <b style="color:${occColor(j.Occupancy)}">${j.Occupancy}</b><br/>
+          Distance to next stop: <b>${j.distance_to_next_km} km</b>
+        `;
+
+        // per-stop ETA list
+        const per = j.per_stop_etas || [];
+        if (per.length){
+          let html = '<b>Per-stop ETAs (mins)</b><ul>';
+          per.forEach(p => {
+            html += `<li>Stop ${p.stop_index}: ${p.eta_minutes_from_now} min (seg ${p.segment_distance_km} km)</li>`;
+          });
+          html += '</ul>';
+          document.getElementById('perStops').innerHTML = html;
+        }
+
+        // Draw occupancy circle around current marker
+        if (occCircle) map.removeLayer(occCircle);
+        const occR = j.Occupancy === "Low" ? 120 : (j.Occupancy === "Medium" ? 200 : 300); // meters (visual)
+        occCircle = L.circle([payload.lat, payload.lon], {radius: occR, color: occColor(j.Occupancy), fillOpacity: 0.12}).addTo(map);
+
+        // Animate bus along remaining route (for demo we use all stops from current to end)
+        // Build path: current location -> stops after stop_index
+        const path = [];
+        path.push([payload.lat, payload.lon]);
+        for (let s = payload.stop_index + 1; s < STOPS.length; s++){
+          path.push(STOPS[s].coords);
+        }
+
+        // Simulation speed-up factor: 60 means 1 real minute = 1 simulated second
+        // adjust so animation completes quickly for demo (total_seconds = total_eta_minutes*60 / speedup)
+        const sim_speedup = 60; // change if you want faster/slower animation
+        const totalSeconds = Math.max(2, (j.total_eta_minutes * 60.0) / sim_speedup);
+
+        animateAlong(path, totalSeconds,
+          (tick) => {
+            // update occupancy circle to follow marker
+            if (occCircle) occCircle.setLatLng([tick.lat,tick.lon]);
+          },
+          () => {
+            // animation complete
+            document.getElementById('debugLog').innerText += '\nAnimation finished.';
+          }
+        );
+
+      } catch (err) {
+        document.getElementById('debugLog').innerText = 'Network / fetch error: ' + err.message;
+      } finally {
+        btn.disabled = false;
+      }
+    }
+
+    // ---------------------------
+    // Analytics: fetch /analytics and render
+    // ---------------------------
+    async function loadAnalytics(){
+      const box = document.getElementById('analyticsBox');
+      const content = document.getElementById('analyticsContent');
+      box.style.display = 'block';
+      content.innerHTML = 'Loading analytics...';
+
+      try {
+        const res = await fetch('http://127.0.0.1:8000/analytics');
+        const j = await res.json();
+
+        if (j.message){
+          content.innerHTML = '<div style="color:#ffcccb">No trip data yet. Run some predictions first.</div>';
+          if (occChart) { occChart.destroy(); occChart = null; }
+          return;
+        }
+
+        // Show simple stats
+        content.innerHTML = `
+          <div class="analyticsRow"><div>Total trips</div><div>${j.total_trips}</div></div>
+          <div class="analyticsRow"><div>Avg speed (km/h)</div><div>${j.average_speed_kmph}</div></div>
+          <div class="analyticsRow"><div>Avg ETA (mins)</div><div>${j.average_eta_minutes}</div></div>
+          <div class="analyticsRow"><div>Avg traffic mult.</div><div>${j.average_traffic_multiplier}</div></div>
+          <div class="analyticsRow"><div>Total distance (km)</div><div>${j.total_distance_km}</div></div>
+        `;
+
+        // Draw occupancy pie chart
+        const occData = [
+          j.occupancy_distribution.Low || 0,
+          j.occupancy_distribution.Medium || 0,
+          j.occupancy_distribution.High || 0
+        ];
+
+        const ctx = document.getElementById('occChart').getContext('2d');
+        if (occChart) occChart.destroy();
+        occChart = new Chart(ctx, {
+          type: 'pie',
+          data: {
+            labels: ['Low','Medium','High'],
+            datasets: [{
+              data: occData,
+              backgroundColor: ['#2ecc71', '#f1c40f', '#e74c3c']
+            }]
+          },
+          options: {
+            plugins: { legend: { position: 'bottom' } }
+          }
+        });
+
+      } catch (err){
+        content.innerHTML = '<div style="color:#ffcccb">Error loading analytics.</div>';
+        console.error('analytics fetch error', err);
+      }
+    }
+
+  </script>
+</body>
+</html>
